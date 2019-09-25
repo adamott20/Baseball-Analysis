@@ -1,0 +1,109 @@
+---
+title: "Win Probability Added"
+author: "Adam Ott"
+date: "8/6/2019"
+output: html_document
+---
+
+Before running this code, read in the events and games files from the repository
+
+```{r}
+library(tidyverse)
+```
+
+Before running this code, read in the events and games files from the repository. If you have already done this, skip this step.
+
+```{r}
+source("events-set-up.R")
+load("data/games.Rda")
+```
+
+In this step, we group events by their game situation(inning, number of outs, team batting, score differential) and find the probability of a team winning given the situation. This can serve as a proxy for commercial win probability charts.
+
+```{r}
+events_win_prob <- events %>% 
+  mutate(Score_Diff = ifelse(BAT_HOME_ID == 1, HOME_SCORE_CT-AWAY_SCORE_CT, AWAY_SCORE_CT-HOME_SCORE_CT), RUNNER_1st = (BASE1_RUN_ID != ""), RUNNER_2nd = (BASE2_RUN_ID != ""), RUNNER_3rd = (BASE3_RUN_ID != "")) %>% 
+  left_join({games %>% 
+              mutate(WINNER = ifelse(HOME_SCORE_CT > AWAY_SCORE_CT, 1, 0)) %>% 
+      select(GAME_ID, WINNER)}, by = "GAME_ID")
+
+win_prob <- events_win_prob %>% 
+  group_by(INN_CT, OUTS_CT, BAT_HOME_ID, Score_Diff, RUNNER_1st, RUNNER_2nd, RUNNER_3rd) %>% 
+  summarize(winprob=mean(BAT_HOME_ID == WINNER)) %>% arrange(INN_CT, OUTS_CT, BAT_HOME_ID, Score_Diff, RUNNER_3rd, RUNNER_2nd, RUNNER_1st)
+```
+
+We then join the win probabilities with the dataframe of events. That allows us to know the win team-agnostic probability before every play since 1919.
+
+```{r}
+events_win_prob <- events_win_prob %>% 
+  left_join(win_prob, by=c("BAT_HOME_ID", "INN_CT", "OUTS_CT", "Score_Diff", "RUNNER_3rd", "RUNNER_2nd", "RUNNER_1st"))
+```
+
+We now want to calculate the win probability added by the batter in each play. We need to account for the end of games and innings, so we have a helper function that accounts for this. We use these functions to calculate the Win Probability Added (WPA) of each play.
+
+```{r}
+is_same <- function(vec) {
+  vec <- vec[1:(length(vec)-1)] == vec[2:length(vec)]
+  vec[length(vec)+1] <- FALSE
+  vec
+}
+
+wpa <- function(df){
+  WPA <- diff(df$winprob)
+  for(i in 1:nrow(df)){
+      if(df$SAME_GAME[i] == FALSE){
+      WPA[i]<- ifelse(df$WINNER[i]==df$BAT_HOME_ID[i], 1-df$winprob[i], -1*df$winprob[i])
+    } else if(df$SAME_INN[i] == FALSE){
+      WPA[i]<- 1-df$winprob[i+1]-df$winprob[i]
+  }
+}
+  WPA
+}
+
+events_WPA <- events_win_prob %>% 
+  mutate(SAME_GAME = is_same(GAME_ID), SAME_INN = is_same(BAT_HOME_ID)) %>% mutate(WPA = wpa(.))
+
+```
+
+We now clean the data a little and filter down to events that end an AB.
+
+```{r}
+events_clean <- events_WPA %>% 
+  filter(BAT_HOME_ID == 1 | INN_CT > 1 | Score_Diff >= 0) %>% 
+  filter(EVENT_CD %in% c(2:3, 12,14:16,19:23))
+```
+
+We can find the expected WPA of every event type (Strike Out, Home Run, Walk, Single, etc.) by averaging the WPA for each event type. We also account for year factors by grouping by year.
+
+```{r}
+xWPA_vals <- events_clean %>%
+  group_by(YEAR_ID, EVENT_CD) %>% 
+  summarize(xWPA = mean(WPA))
+```
+
+We can now calculate the Expected Wins Above Average for each batter by summing their xWPA for an entire season. Here we have done so for the 2018 season. We have arranged the results in descending order of xWAA. Unsurprisingly, the AL MVP Mookie Betts led the league, with MVP candidates Mike Trout and Jose Martinez, as well as NL MVP close behind.
+
+```{r}
+events_clean %>% 
+  filter(YEAR_ID == 2018) %>% 
+  left_join(xWPA_vals, by = c("YEAR_ID","EVENT_CD")) %>% 
+  group_by(BAT_ID) %>% 
+  summarize(VALUE_ADDED = sum(WPA), X_VALUE_ADDED = sum(xWPA)) %>% 
+  mutate(DIFFERENCE = VALUE_ADDED - X_VALUE_ADDED) %>%
+  filter(X_VALUE_ADDED > 2) %>% 
+  arrange(desc(X_VALUE_ADDED))
+```
+
+We now do the same for 2018 pitchers. NL Cy Young Jacob deGrom has a large lead over the next closest pitchers, with other Cy Young contenders littering the top of the leaderboard. Interestingly, deGrom has an even higher WAA than his xWAA, largely due to the amount he pitched in close contests.
+
+```{r}
+events_clean %>% 
+  filter(YEAR_ID == 2018) %>% 
+  left_join(xWPA_vals, by = c("EVENT_CD", "YEAR_ID")) %>% 
+  group_by(PIT_ID) %>% 
+  summarize(VALUE_ADDED = -1*sum(WPA), X_VALUE_ADDED = -1*sum(xWPA)) %>% 
+  mutate(DIFFERENCE = VALUE_ADDED - X_VALUE_ADDED) %>%
+  filter(X_VALUE_ADDED > 2) %>% 
+  arrange(desc(X_VALUE_ADDED))
+```
+
